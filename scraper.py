@@ -62,6 +62,7 @@ async def scrape_tweets(config: dict) -> list[dict]:
     tweets = [
         {"id": tweet.id, "text": tweet.text, "likes": tweet.favorite_count}
         for tweet in results
+        if tweet.retweeted_tweet is None
     ]
 
     print(f"Fetched {len(tweets)} tweets from @{config['twitter_target_user']}")
