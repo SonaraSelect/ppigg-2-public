@@ -281,6 +281,7 @@ async def dispatch_command(message: discord.Message, cmd: str, arg: str) -> None
         "type": handle_type,       "ty": handle_type,
         "set": handle_set,
         "get": handle_get,         "ge": handle_get,
+        "kill": handle_kill,       "k":  handle_kill,
     }
     handler = table.get(cmd)
     if handler:
@@ -351,6 +352,7 @@ async def handle_help(message: discord.Message, arg: str = "") -> None:
         "",
         "**Admin**",
         "`adminme`           — Claim the boss role",
+        "`kill` / `k`        — Shut the bot down",
     ]
     await message.channel.send("\n".join(lines))
 
@@ -721,6 +723,17 @@ async def handle_get(message: discord.Message, arg: str = "") -> None:
         value = config.get(key) if key else None
         lines.append(f"`{code}` {labels[code]}: {formatter(value)}")
     await message.channel.send("\n".join(lines))
+
+# ---------------------------------------------------------------------------
+# Command: kill
+# ---------------------------------------------------------------------------
+
+async def handle_kill(message: discord.Message, arg: str = "") -> None:
+    await message.channel.send(
+        "Alright boss, I'm goin' dark. It's been an honor workin' for ya. "
+        "Don't let 'em find the stash."
+    )
+    await client.close()
 
 # ---------------------------------------------------------------------------
 # Entry point
