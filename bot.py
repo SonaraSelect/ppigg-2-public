@@ -1,25 +1,17 @@
-import asyncio
-import json
-import os
 import random
-import re
-import uuid
-from datetime import datetime, timedelta, timezone
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta
 
 import discord
 from discord.ext import tasks
 
 import scraper
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-EST = ZoneInfo("America/New_York")
-CONFIG_FILE = "config.json"
-STATE_FILE = "state.json"
-MESSAGES_FILE = "saved_messages.json"
+from storage import load_config, save_config, load_state, save_state, load_messages, save_messages
+from time_utils import now_est, time_in_window, parse_window, parse_minmax
+from messages import (get_unposted_messages, pick_random_unposted, find_message_by_id,
+                      add_scraped_tweets, add_custom_message)
+from scheduler import calculate_next_post_time, is_post_day, ensure_queued_post
+from discord_utils import (send_with_typing, notify_admin,
+                           hours_since_last_channel_message, get_post_channel)
 
 # ---------------------------------------------------------------------------
 # Module-level globals
@@ -37,277 +29,6 @@ _presence_until: datetime | None = None
 
 # Scrape timing — not persisted, recalculated each restart
 _last_scrape_time: datetime | None = None
-
-# ---------------------------------------------------------------------------
-# File I/O helpers
-# ---------------------------------------------------------------------------
-
-def load_config() -> dict:
-    with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-        return json.load(f)
-
-
-def _default_state() -> dict:
-    return {
-        "next_post_time": None,
-        "queued_post_id": None,
-        "paused": False,
-        "last_post_time": None,
-        "list_offset": 0,
-    }
-
-
-def load_state() -> dict:
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            data = json.load(f)
-        defaults = _default_state()
-        defaults.update(data)
-        return defaults
-    except Exception:
-        return _default_state()
-
-
-def save_state() -> None:
-    try:
-        tmp = STATE_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(state, f, indent=2)
-        os.replace(tmp, STATE_FILE)
-    except Exception as e:
-        print(f"[warn] Could not save state: {e}")
-
-
-def load_messages() -> list[dict]:
-    try:
-        with open(MESSAGES_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
-
-
-def save_messages() -> None:
-    try:
-        tmp = MESSAGES_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(messages, f, indent=2, ensure_ascii=False)
-        os.replace(tmp, MESSAGES_FILE)
-    except Exception as e:
-        print(f"[warn] Could not save messages: {e}")
-
-
-def save_config() -> None:
-    try:
-        tmp = CONFIG_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(config, f, indent=2)
-        os.replace(tmp, CONFIG_FILE)
-    except Exception as e:
-        print(f"[warn] Could not save config: {e}")
-
-# ---------------------------------------------------------------------------
-# Time / timezone helpers
-# ---------------------------------------------------------------------------
-
-def now_est() -> datetime:
-    return datetime.now(tz=EST)
-
-
-def parse_hhmm(s: str) -> tuple[int, int]:
-    parts = s.strip().split(":")
-    if len(parts) != 2:
-        raise ValueError(f"Expected HH:MM, got '{s}'")
-    return int(parts[0]), int(parts[1])
-
-
-def time_in_window(now: datetime, start_str: str, end_str: str) -> bool:
-    sh, sm = parse_hhmm(start_str)
-    eh, em = parse_hhmm(end_str)
-    current = now.hour * 60 + now.minute
-    start = sh * 60 + sm
-    end = eh * 60 + em
-    if start <= end:
-        return start <= current < end
-    # crosses midnight
-    return current >= start or current < end
-
-
-def make_est_datetime(date, hhmm_str: str) -> datetime:
-    h, m = parse_hhmm(hhmm_str)
-    return datetime(date.year, date.month, date.day, h, m, 0, tzinfo=EST)
-
-
-def parse_window(value: str) -> tuple[str, str]:
-    """Parse 'HH:MM - HH:MM' into (start, end)."""
-    pattern = r"^\s*(\d{1,2}:\d{2})\s*-\s*(\d{1,2}:\d{2})\s*$"
-    m = re.match(pattern, value)
-    if not m:
-        raise ValueError(f"Expected HH:MM - HH:MM, got '{value}'")
-    start, end = m.group(1).zfill(5), m.group(2).zfill(5)
-    parse_hhmm(start)
-    parse_hhmm(end)
-    return start, end
-
-
-def parse_minmax(value: str) -> tuple[float, float]:
-    """Parse 'N - M' or 'N-M' into (min, max) floats."""
-    pattern = r"^\s*(\d+(?:\.\d+)?)\s*-\s*(\d+(?:\.\d+)?)\s*$"
-    m = re.match(pattern, value)
-    if not m:
-        raise ValueError(f"Expected N - M, got '{value}'")
-    lo, hi = float(m.group(1)), float(m.group(2))
-    if lo > hi:
-        raise ValueError("Min must be <= max")
-    return lo, hi
-
-# ---------------------------------------------------------------------------
-# Message helpers
-# ---------------------------------------------------------------------------
-
-def get_unposted_messages(min_likes: int) -> list[dict]:
-    return [
-        m for m in messages
-        if not m.get("posted_to_discord") and m.get("likes", 0) >= min_likes
-    ]
-
-
-def pick_random_unposted(min_likes: int) -> dict | None:
-    pool = get_unposted_messages(min_likes)
-    return random.choice(pool) if pool else None
-
-
-def find_message_by_id(msg_id: str | None) -> dict | None:
-    if not msg_id:
-        return None
-    for m in messages:
-        if m["id"] == msg_id:
-            return m
-    return None
-
-
-def add_scraped_tweets(new_tweets: list[dict]) -> int:
-    min_likes = config.get("twitter_min_likes", 0)
-    changed = False
-    added = 0
-    for tweet in new_tweets:
-        existing = find_message_by_id(tweet["id"])
-        if existing:
-            if existing["likes"] != tweet["likes"]:
-                existing["likes"] = tweet["likes"]
-                changed = True
-        else:
-            if tweet["likes"] >= min_likes:
-                messages.append({
-                    "id": tweet["id"],
-                    "text": tweet["text"],
-                    "likes": tweet["likes"],
-                    "source": "scraped",
-                    "posted_to_discord": False,
-                    "added_at": now_est().isoformat(),
-                })
-                added += 1
-                changed = True
-    if changed:
-        save_messages()
-    return added
-
-
-def add_custom_message(text: str) -> tuple[bool, str]:
-    text_stripped = text.strip()
-    text_lower = text_stripped.lower()
-    for m in messages:
-        if m.get("text", "").lower() == text_lower:
-            return False, "Ey boss, I already got that one in the stash!"
-    messages.append({
-        "id": str(uuid.uuid4()),
-        "text": text_stripped,
-        "likes": 0,
-        "source": "custom",
-        "posted_to_discord": False,
-        "added_at": now_est().isoformat(),
-    })
-    save_messages()
-    return True, "Done, boss! Added it to the stash, nice and clean."
-
-# ---------------------------------------------------------------------------
-# Scheduling helpers
-# ---------------------------------------------------------------------------
-
-def calculate_next_post_time(from_time: datetime | None = None) -> datetime:
-    base = from_time or now_est()
-    interval = int(config.get("post_interval_days", 1))
-    next_date = (base + timedelta(days=interval)).date()
-    return make_est_datetime(next_date, config.get("post_window_start", "10:00"))
-
-
-def is_post_day() -> bool:
-    npt = state.get("next_post_time")
-    if not npt:
-        return False
-    try:
-        dt = datetime.fromisoformat(npt)
-        return now_est().date() >= dt.date()
-    except Exception:
-        return False
-
-
-def ensure_queued_post() -> bool:
-    qid = state.get("queued_post_id")
-    msg = find_message_by_id(qid)
-    if msg and not msg.get("posted_to_discord"):
-        return True
-    # Need a new post
-    min_likes = config.get("twitter_min_likes", 0)
-    chosen = pick_random_unposted(min_likes)
-    if chosen:
-        state["queued_post_id"] = chosen["id"]
-        save_state()
-        return True
-    state["queued_post_id"] = None
-    save_state()
-    return False
-
-# ---------------------------------------------------------------------------
-# Async helpers
-# ---------------------------------------------------------------------------
-
-async def send_with_typing(channel: discord.TextChannel, content: str) -> None:
-    delay = len(content) * 0.1
-    async with channel.typing():
-        await asyncio.sleep(delay)
-    await channel.send(content)
-
-
-async def notify_admin(message: str) -> None:
-    try:
-        admin_id = config.get("admin_user_id", 0)
-        if not admin_id:
-            print(f"[notify_admin] No admin set. Message: {message}")
-            return
-        user = await client.fetch_user(int(admin_id))
-        dm = await user.create_dm()
-        await dm.send(message)
-    except Exception as e:
-        print(f"[notify_admin] Failed to reach admin: {e}. Message was: {message}")
-
-
-async def hours_since_last_channel_message(channel) -> float | None:
-    try:
-        async for msg in channel.history(limit=1):
-            now_utc = datetime.now(tz=timezone.utc)
-            delta = now_utc - msg.created_at.replace(tzinfo=timezone.utc) if msg.created_at.tzinfo is None else now_utc - msg.created_at
-            return delta.total_seconds() / 3600
-    except Exception:
-        pass
-    return None
-
-
-async def get_post_channel():
-    channel_id = int(config.get("discord_channel_id", 0))
-    channel = client.get_channel(channel_id)
-    if channel is None:
-        channel = await client.fetch_channel(channel_id)
-    return channel
 
 # ---------------------------------------------------------------------------
 # Discord events
@@ -330,17 +51,17 @@ async def on_ready() -> None:
         try:
             npt = datetime.fromisoformat(npt_raw)
             if npt < now:
-                state["next_post_time"] = calculate_next_post_time(now).isoformat()
-                save_state()
+                state["next_post_time"] = calculate_next_post_time(config, now).isoformat()
+                save_state(state)
                 print("[ready] next_post_time was in the past — recalculated.")
         except Exception:
-            state["next_post_time"] = calculate_next_post_time(now).isoformat()
-            save_state()
+            state["next_post_time"] = calculate_next_post_time(config, now).isoformat()
+            save_state(state)
     else:
-        state["next_post_time"] = calculate_next_post_time(now).isoformat()
-        save_state()
+        state["next_post_time"] = calculate_next_post_time(config, now).isoformat()
+        save_state(state)
 
-    if not ensure_queued_post():
+    if not ensure_queued_post(state, config, messages):
         print("[ready] No unposted messages available for queue.")
 
     presence_manager.start()
@@ -391,7 +112,7 @@ async def presence_manager() -> None:
 @presence_manager.error
 async def presence_manager_error(error: Exception) -> None:
     print(f"[presence_manager] Error: {error}")
-    await notify_admin(f"Ey boss, the presence thing had a hiccup: {error}")
+    await notify_admin(client, config, f"Ey boss, the presence thing had a hiccup: {error}")
 
 # ---------------------------------------------------------------------------
 # Task loop 2: Post heartbeat (every 7 minutes)
@@ -401,7 +122,7 @@ async def presence_manager_error(error: Exception) -> None:
 async def post_heartbeat() -> None:
     if state.get("paused"):
         return
-    if not is_post_day():
+    if not is_post_day(state):
         return
 
     now = now_est()
@@ -412,8 +133,9 @@ async def post_heartbeat() -> None:
     ):
         return
 
-    if not ensure_queued_post():
+    if not ensure_queued_post(state, config, messages):
         await notify_admin(
+            client, config,
             "Ey boss, I got nothin' left to post — the queue's all dried up, capisce? "
             "Try 'scrape' or 'submit' to add more."
         )
@@ -424,53 +146,54 @@ async def post_heartbeat() -> None:
         return
 
     try:
-        channel = await get_post_channel()
+        channel = await get_post_channel(client, config)
     except Exception as e:
-        await notify_admin(f"Ey boss, I can't find the channel: {e}")
+        await notify_admin(client, config, f"Ey boss, I can't find the channel: {e}")
         return
 
     hours_elapsed = await hours_since_last_channel_message(channel)
     spacer = float(config.get("post_spacer_hours", 4.0))
 
     if hours_elapsed is not None and hours_elapsed < spacer:
-        next_dt = calculate_next_post_time(now)
+        next_dt = calculate_next_post_time(config, now)
         state["next_post_time"] = next_dt.isoformat()
-        save_state()
+        save_state(state)
         formatted = next_dt.strftime("%A, %B %d at %I:%M %p %Z")
         await notify_admin(
+            client, config,
             f"Ey boss, I wanted to post but somebody was already talking in there "
             f"{hours_elapsed:.1f} hours ago — not enough space. "
             f"I'll try again {formatted}, boss."
         )
         return
 
-    msg = find_message_by_id(state.get("queued_post_id"))
+    msg = find_message_by_id(messages, state.get("queued_post_id"))
     if msg is None:
-        ensure_queued_post()
+        ensure_queued_post(state, config, messages)
         return
 
     try:
         await send_with_typing(channel, msg["text"])
     except Exception as e:
-        await notify_admin(f"Ey boss, I tried to post but somethin' went wrong: {e}")
+        await notify_admin(client, config, f"Ey boss, I tried to post but somethin' went wrong: {e}")
         return
 
     msg["posted_to_discord"] = True
-    save_messages()
+    save_messages(messages)
 
     state["last_post_time"] = now.isoformat()
     state["queued_post_id"] = None
-    state["next_post_time"] = calculate_next_post_time(now).isoformat()
-    save_state()
+    state["next_post_time"] = calculate_next_post_time(config, now).isoformat()
+    save_state(state)
 
-    ensure_queued_post()
-    save_state()
+    ensure_queued_post(state, config, messages)
+    save_state(state)
 
 
 @post_heartbeat.error
 async def post_heartbeat_error(error: Exception) -> None:
     print(f"[post_heartbeat] Error: {error}")
-    await notify_admin(f"Ey boss, the posting machine had a hiccup: {error}")
+    await notify_admin(client, config, f"Ey boss, the posting machine had a hiccup: {error}")
 
 # ---------------------------------------------------------------------------
 # Task loop 3: Scrape loop (every 1 hour, internal rate gate)
@@ -492,20 +215,20 @@ async def scrape_loop() -> None:
     try:
         new_tweets = await scraper.scrape_tweets(config)
     except Exception as e:
-        await notify_admin(f"Ey boss, the Twitter machine's actin' up: {e}")
+        await notify_admin(client, config, f"Ey boss, the Twitter machine's actin' up: {e}")
         return
 
-    added = add_scraped_tweets(new_tweets)
+    added = add_scraped_tweets(messages, new_tweets, config)
     print(f"[scrape] Got {len(new_tweets)} tweets, {added} new added.")
 
-    ensure_queued_post()
-    save_state()
+    ensure_queued_post(state, config, messages)
+    save_state(state)
 
 
 @scrape_loop.error
 async def scrape_loop_error(error: Exception) -> None:
     print(f"[scrape_loop] Error: {error}")
-    await notify_admin(f"Ey boss, the scraper loop blew a fuse: {error}")
+    await notify_admin(client, config, f"Ey boss, the scraper loop blew a fuse: {error}")
 
 # ---------------------------------------------------------------------------
 # Message event & command routing
@@ -573,7 +296,7 @@ async def handle_adminme(message: discord.Message, arg: str = "") -> None:
 
     if not current_admin or current_admin == 0:
         config["admin_user_id"] = sender_id
-        save_config()
+        save_config(config)
         await message.channel.send(
             "You're the boss now, boss. The whole operation's yours."
         )
@@ -637,7 +360,7 @@ async def handle_help(message: discord.Message, arg: str = "") -> None:
 
 async def handle_show(message: discord.Message, arg: str = "") -> None:
     qid = state.get("queued_post_id")
-    msg = find_message_by_id(qid)
+    msg = find_message_by_id(messages, qid)
     if msg is None:
         await message.channel.send(
             "Ey boss, I got nothin' queued up right now. Try 'scrape' or 'submit'."
@@ -670,7 +393,7 @@ async def handle_config(message: discord.Message, arg: str = "") -> None:
 
 async def _send_list_page(message: discord.Message, offset: int, count: int) -> None:
     min_likes = config.get("twitter_min_likes", 0)
-    pool = get_unposted_messages(min_likes)
+    pool = get_unposted_messages(messages, min_likes)
     page = pool[offset:offset + count]
     if not page:
         await message.channel.send(
@@ -680,7 +403,6 @@ async def _send_list_page(message: discord.Message, offset: int, count: int) -> 
     lines = []
     for i, m in enumerate(page, start=offset + 1):
         preview = m["text"].replace("\n", " ")[:80]
-        tag = m["source"]
         likes_str = f"{m['likes']} likes" if m["source"] == "scraped" else "custom"
         lines.append(f"`{i}.` [{likes_str}] {preview}…")
     total = len(pool)
@@ -691,7 +413,7 @@ async def _send_list_page(message: discord.Message, offset: int, count: int) -> 
 
 async def handle_list(message: discord.Message, arg: str = "") -> None:
     state["list_offset"] = 0
-    save_state()
+    save_state(state)
     await _send_list_page(message, 0, 5)
 
 
@@ -701,7 +423,7 @@ async def handle_more(message: discord.Message, arg: str = "") -> None:
         count = int(arg.strip())
     offset = state.get("list_offset", 0) + count
     state["list_offset"] = offset
-    save_state()
+    save_state(state)
     await _send_list_page(message, offset, count)
 
 # ---------------------------------------------------------------------------
@@ -719,10 +441,10 @@ async def handle_scrape(message: discord.Message, arg: str = "") -> None:
         await message.channel.send(f"It didn't work, boss. Error: {e}")
         return
 
-    added = add_scraped_tweets(new_tweets)
+    added = add_scraped_tweets(messages, new_tweets, config)
     _last_scrape_time = now_est()
-    ensure_queued_post()
-    save_state()
+    ensure_queued_post(state, config, messages)
+    save_state(state)
     await message.channel.send(
         f"Done, boss! I picked up {len(new_tweets)} tweets — "
         f"{added} new one(s) added to the stash."
@@ -735,14 +457,14 @@ async def handle_scrape(message: discord.Message, arg: str = "") -> None:
 async def handle_skip(message: discord.Message, arg: str = "") -> None:
     current_id = state.get("queued_post_id")
     if current_id:
-        msg = find_message_by_id(current_id)
+        msg = find_message_by_id(messages, current_id)
         if msg:
             msg["posted_to_discord"] = True
-            save_messages()
+            save_messages(messages)
 
     state["queued_post_id"] = None
-    if ensure_queued_post():
-        new_msg = find_message_by_id(state["queued_post_id"])
+    if ensure_queued_post(state, config, messages):
+        new_msg = find_message_by_id(messages, state["queued_post_id"])
         preview = (new_msg["text"][:80] + "…") if new_msg else "somethin' new"
         await message.channel.send(
             f"Skipped, boss. New one lined up:\n\n{preview}"
@@ -759,7 +481,7 @@ async def handle_skip(message: discord.Message, arg: str = "") -> None:
 async def handle_shuffle(message: discord.Message, arg: str = "") -> None:
     min_likes = config.get("twitter_min_likes", 0)
     current_id = state.get("queued_post_id")
-    pool = get_unposted_messages(min_likes)
+    pool = get_unposted_messages(messages, min_likes)
 
     # Try to pick something different from the current
     candidates = [m for m in pool if m["id"] != current_id] if current_id else pool
@@ -774,7 +496,7 @@ async def handle_shuffle(message: discord.Message, arg: str = "") -> None:
 
     chosen = random.choice(candidates)
     state["queued_post_id"] = chosen["id"]
-    save_state()
+    save_state(state)
     preview = chosen["text"][:80] + "…"
     await message.channel.send(
         f"Shuffled, boss! How about this one:\n\n{preview}"
@@ -786,7 +508,7 @@ async def handle_shuffle(message: discord.Message, arg: str = "") -> None:
 
 async def handle_pause(message: discord.Message, arg: str = "") -> None:
     state["paused"] = not state.get("paused", False)
-    save_state()
+    save_state(state)
     if state["paused"]:
         await message.channel.send(
             "Alright boss, I'm layin' low — no more postin' till you say so."
@@ -830,11 +552,11 @@ async def handle_submit(message: discord.Message, arg: str = "") -> None:
             "Ey boss, you gotta give me the text to add!"
         )
         return
-    success, reply = add_custom_message(arg)
+    success, reply = add_custom_message(messages, arg)
     await message.channel.send(reply)
     if success:
-        ensure_queued_post()
-        save_state()
+        ensure_queued_post(state, config, messages)
+        save_state(state)
 
 # ---------------------------------------------------------------------------
 # Command: type
@@ -847,7 +569,7 @@ async def handle_type(message: discord.Message, arg: str = "") -> None:
         )
         return
     try:
-        channel = await get_post_channel()
+        channel = await get_post_channel(client, config)
         await send_with_typing(channel, arg)
         await message.channel.send("Done, boss! Slipped it right in there, nice and smooth.")
     except Exception as e:
@@ -871,46 +593,46 @@ async def handle_set(message: discord.Message, arg: str = "") -> None:
     try:
         if sub == "ch":
             config["discord_channel_id"] = int(value)
-            save_config()
+            save_config(config)
             await message.channel.send(f"You got it, boss. Channel is now `{value}`.")
 
         elif sub == "ti":
             config["post_interval_days"] = int(value)
-            save_config()
+            save_config(config)
             await message.channel.send(f"You got it, boss. Posting every `{value}` day(s).")
 
         elif sub == "wi":
             start, end = parse_window(value)
             config["post_window_start"] = start
             config["post_window_end"] = end
-            save_config()
+            save_config(config)
             await message.channel.send(f"You got it, boss. Post window is `{start} – {end}`.")
 
         elif sub == "sp":
             config["post_spacer_hours"] = float(value)
-            save_config()
+            save_config(config)
             await message.channel.send(f"You got it, boss. Spacer is `{value}` hour(s).")
 
         elif sub == "ml":
             config["twitter_min_likes"] = int(value)
-            save_config()
+            save_config(config)
             await message.channel.send(f"You got it, boss. Min likes is `{value}`.")
 
         elif sub == "ow":
             start, end = parse_window(value)
             config["online_window_start"] = start
             config["online_window_end"] = end
-            save_config()
+            save_config(config)
             await message.channel.send(f"You got it, boss. Online window is `{start} – {end}`.")
 
         elif sub == "pr":
             config["twitter_poll_rate_hours"] = int(value)
-            save_config()
+            save_config(config)
             await message.channel.send(f"You got it, boss. Scraping every `{value}` hour(s).")
 
         elif sub == "pn":
             config["twitter_poll_count"] = min(int(value), 40)
-            save_config()
+            save_config(config)
             await message.channel.send(
                 f"You got it, boss. Polling `{config['twitter_poll_count']}` tweets per scrape."
             )
@@ -920,14 +642,14 @@ async def handle_set(message: discord.Message, arg: str = "") -> None:
             if not 0 <= v <= 100:
                 raise ValueError("Must be 0–100")
             config["post_chance_percent"] = v
-            save_config()
+            save_config(config)
             await message.channel.send(f"You got it, boss. Post chance is `{v}%`.")
 
         elif sub == "on":
             lo, hi = parse_minmax(value)
             config["online_min_minutes"] = lo
             config["online_max_minutes"] = hi
-            save_config()
+            save_config(config)
             await message.channel.send(
                 f"You got it, boss. Online duration is `{lo}–{hi}` minutes."
             )
@@ -936,7 +658,7 @@ async def handle_set(message: discord.Message, arg: str = "") -> None:
             lo, hi = parse_minmax(value)
             config["offline_min_minutes"] = lo
             config["offline_max_minutes"] = hi
-            save_config()
+            save_config(config)
             await message.channel.send(
                 f"You got it, boss. Offline duration is `{lo}–{hi}` minutes."
             )
@@ -949,7 +671,7 @@ async def handle_set(message: discord.Message, arg: str = "") -> None:
     except (ValueError, TypeError):
         await message.channel.send("It didn't work, boss. Check the format and try again.")
 
-    
+
 async def handle_get(message: discord.Message, arg: str = "") -> None:
     sub = arg.strip().lower()
 
