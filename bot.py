@@ -5,6 +5,7 @@ import discord
 from discord.ext import tasks
 
 import scraper
+import scraper_tw
 from storage import load_config, save_config, load_state, save_state, load_messages, save_messages
 from time_utils import now_est, time_in_window, parse_window, parse_minmax
 from messages import (get_unposted_messages, pick_random_unposted, find_message_by_id,
@@ -20,6 +21,13 @@ from discord_utils import (send_with_typing, notify_admin,
 config: dict = {}
 state: dict = {}
 messages: list[dict] = []
+
+
+async def _scrape(cfg: dict) -> list[dict]:
+    if cfg.get("twitter_scraper") == "twscrape":
+        return await scraper_tw.scrape_tweets(cfg)
+    return await scraper.scrape_tweets(cfg)
+
 
 client = discord.Client()
 
@@ -213,7 +221,7 @@ async def scrape_loop() -> None:
     _last_scrape_time = now
 
     try:
-        new_tweets = await scraper.scrape_tweets(config)
+        new_tweets = await _scrape(config)
     except Exception as e:
         await notify_admin(client, config, f"Ey boss, the Twitter machine's actin' up: {e}")
         return
@@ -438,7 +446,7 @@ async def handle_scrape(message: discord.Message, arg: str = "") -> None:
         "Ey boss, gimme a sec — I'm goin' out to get the goods..."
     )
     try:
-        new_tweets = await scraper.scrape_tweets(config)
+        new_tweets = await _scrape(config)
     except Exception as e:
         await message.channel.send(f"It didn't work, boss. Error: {e}")
         return
