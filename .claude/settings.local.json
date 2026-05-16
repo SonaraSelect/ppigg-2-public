@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(pip show *)",
+      "Bash(/mnt/c/Users/the5t/OneDrive/Documents/GitHub/ppigg-2-public/venv/bin/pip show *)",
+      "Bash(/mnt/c/Users/the5t/OneDrive/Documents/GitHub/ppigg-2-public/venv/bin/python *)",
+      "Bash(python3 -c \"import twikit; print\\(twikit.__file__\\)\")",
+      "Bash(xargs cat)",
+      "Bash(python3 -c \"import sys; print\\('\\\\n'.join\\(sys.path\\)\\)\")",
+      "WebFetch(domain:github.com)",
+      "WebSearch",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:twikit.readthedocs.io)"
+    ]
+  }
+}

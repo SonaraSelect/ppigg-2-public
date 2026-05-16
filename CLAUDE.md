@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 python bot.py
 ```
 
-No build step, test suite, or lint tooling exists. Dependencies (discord.py, twikit, twscrape) must be installed manually — there is no `requirements.txt`.
+A `venv/` directory is present — activate it first if needed. No build step, test suite, or lint tooling exists. Dependencies (`discord.py`, `twikit`, `twscrape`) must be installed manually — there is no `requirements.txt`.
 
 ## Configuration
 
@@ -20,7 +20,18 @@ Copy `cfg_format.json` to `config.json` and fill in values before running. `conf
 - `post_interval_days`, `post_window_start/end`, `post_spacer_hours`, `post_chance_percent` — probabilistic posting schedule
 - `online_window_start/end`, `online/offline_min/max_minutes` — presence simulation
 
-Runtime state is persisted to `state.json` (next post time, queued message ID, pause status). Messages are stored in `saved_messages.json`.
+All time windows are interpreted in **America/New_York** (EST/EDT).
+
+Runtime state is persisted to `state.json` with keys: `next_post_time`, `queued_post_id`, `paused`, `last_post_time`, `list_offset`. Messages are stored in `saved_messages.json` as a list of objects with keys: `id`, `text`, `likes`, `source` (`"scraped"` or `"custom"`), `posted_to_discord`, `added_at`.
+
+## Scraper Authentication
+
+**twikit** (`scraper.py`) tries credentials in this order:
+1. `twitter_raw_cookies_file` — Cookie-Editor browser extension export (list of `{name, value}` dicts)
+2. `twitter_cookies_file` — twikit's own saved cookie format
+3. Programmatic login via `twitter_username`/`twitter_email`/`twitter_password` (unreliable; cookie export is preferred)
+
+**twscrape** (`scraper_tw.py`) stores account credentials in a SQLite database (`twscrape_db_path`, default `twscrape_accounts.db`). Each scrape call re-adds the account (silently ignores "already exists"), then calls `login_all()`. Cookie-based auth uses the `twscrape_cookies` field (`ct0=...; auth_token=...`).
 
 ## Architecture
 
@@ -44,8 +55,8 @@ The bot is a single Discord client instance split into functional modules — no
 | `scraper.py` | `twikit`-based scraper (cookie login or username/password) |
 | `scraper_tw.py` | `twscrape`-based scraper (account pool approach) |
 
-**Admin control** is via Discord DMs only. Any user can claim admin with `adminme` if unclaimed. Commands include short aliases (`c` for config, `sh` for show, `p` for post, `s` for scrape, etc.).
+**Admin control** is via Discord DMs only. Any user can claim admin with `adminme` if unclaimed. Commands include short aliases (`c` for config, `sh` for show, `ty` for immediate post to channel, `sc` for scrape, etc.). The `get` command mirrors `set` but reads values rather than writing them.
 
-**Scraper selection** is config-driven at runtime: `scraper.py` is used when `twitter_scraper == "twikit"`, `scraper_tw.py` when `"twscrape"`. Both return the same data shape so the scrape loop is backend-agnostic.
+**Scraper selection** is config-driven at runtime: `scraper.py` is used when `twitter_scraper == "twikit"`, `scraper_tw.py` when `"twscrape"`. Both return the same data shape (`id`, `text`, `likes`) so the scrape loop is backend-agnostic.
 
 **Post eligibility** requires all of: not paused, today is a scheduled post day, current time is within `post_window_start/end`, at least `post_spacer_hours` since the last post (checked via channel history), and a random roll under `post_chance_percent`.
