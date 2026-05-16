@@ -1,0 +1,41 @@
+{
+  "_NOTE": "Copy this file to config.json and fill in your values. Remove any keys you don't need.",
+
+  "discord_token": "YOUR_DISCORD_BOT_TOKEN",
+  "admin_user_id": 123456789012345678,
+  "discord_channel_id": 123456789012345678,
+
+  "twitter_target_user": "username_to_scrape",
+
+  "twitter_scraper": "twikit",
+
+  "twitter_cookies_file": "cookies.json",
+  "twitter_raw_cookies_file": "cookies_raw.json",
+  "twitter_username": "your_twitter_username",
+  "twitter_email": "your_twitter_email@example.com",
+  "twitter_password": "your_twitter_password",
+
+  "twscrape_username": "your_twitter_username",
+  "twscrape_password": "your_twitter_password",
+  "twscrape_email": "your_twitter_email@example.com",
+  "twscrape_email_password": "your_email_account_password",
+  "twscrape_cookies": "ct0=XXXX; auth_token=YYYY",
+  "twscrape_db_path": "twscrape_accounts.db",
+
+  "twitter_poll_count": 40,
+  "twitter_poll_rate_hours": 2,
+  "twitter_min_likes": 0,
+
+  "post_interval_days": 1,
+  "post_window_start": "10:00",
+  "post_window_end": "20:00",
+  "post_spacer_hours": 4.0,
+  "post_chance_percent": 30,
+
+  "online_window_start": "09:00",
+  "online_window_end": "23:00",
+  "online_min_minutes": 10,
+  "online_max_minutes": 45,
+  "offline_min_minutes": 5,
+  "offline_max_minutes": 20
+}
