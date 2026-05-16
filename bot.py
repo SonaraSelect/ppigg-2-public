@@ -412,7 +412,7 @@ async def _send_list_page(message: discord.Message, offset: int, count: int) -> 
         return
     lines = []
     for i, m in enumerate(page, start=offset + 1):
-        preview = m["text"].replace("\n", " ")[:80]
+        preview = m["text"].replace("\n", " ")  # todo I edited this, it should now show the whole tweet in the preview
         likes_str = f"{m['likes']} likes" if m["source"] == "scraped" else "custom"
         lines.append(f"`{i}.` [{likes_str}] {preview}…")
     total = len(pool)
